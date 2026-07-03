@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-OSINT Deep Dorking Suite — Nama ke Jejak Digital (Telepon, Email, Alamat)
+OSINT Deep Dorking Suite — Perbaikan Ekstraksi Kontak
 Penulis: Lyra untuk Kael
-Deskripsi: Menggali hasil pencarian Google dengan operator canggih, white pages,
-           direktori publik, dan breach database untuk mengumpulkan data kontak.
-           Semua data yang ditemukan adalah informasi publik yang dapat diakses secara legal.
+Perubahan: Ekstraksi langsung dari snippet Google + parsing HTML yang lebih baik.
 """
 
 import requests
@@ -19,9 +17,17 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fake_useragent import UserAgent
 
+# Optional: BeautifulSoup untuk parsing HTML yang lebih baik
+try:
+    from bs4 import BeautifulSoup
+    HAS_SOUP = True
+except ImportError:
+    HAS_SOUP = False
+    logging.warning("BeautifulSoup tidak terinstall. Gunakan 'pip install beautifulsoup4' untuk hasil lebih baik.")
+
 # ---------- Konfigurasi ----------
 MAX_THREADS = 10
-REQUEST_DELAY = 2.0       # Jeda antar permintaan agar tidak kena blokir
+REQUEST_DELAY = 2.0
 TIMEOUT = 20
 OUTPUT_DIR = Path("./osint_deep_results")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -57,7 +63,6 @@ class DeepDorkEngine:
         self._variants = self._generate_variants(full_name)
 
     def _generate_variants(self, name: str) -> List[str]:
-        """Menghasilkan berbagai variasi nama untuk pencarian."""
         parts = name.split()
         if len(parts) < 2:
             return [name]
@@ -87,7 +92,6 @@ class DeepDorkEngine:
         }
 
     def _fetch(self, url: str, params: Optional[Dict] = None) -> Optional[str]:
-        """Mengambil konten halaman dengan jeda dan rotasi header."""
         time.sleep(REQUEST_DELAY)
         try:
             resp = self.session.get(url, headers=self._get_headers(),
@@ -105,107 +109,8 @@ class DeepDorkEngine:
             logger.debug(f"Gagal mengambil {url}: {e}")
             return None
 
-    # ---------- MODUL PENCARIAN UTAMA ----------
-
-    def google_dork_phone_email_address(self, query: str) -> List[Dict]:
-        """
-        Menggunakan Google dorking untuk mencari:
-        - Nomor telepon (pattern +XX, 08xx, dll)
-        - Email (pattern @)
-        - Alamat (pattern jalan, kota, kode pos)
-        """
-        dorks = [
-            f'"{query}" "phone" -site:gov -site:mil',
-            f'"{query}" "email" -site:gov -site:mil',
-            f'"{query}" "address" -site:gov -site:mil',
-            f'"{query}" "tel:" -site:gov -site:mil',
-            f'"{query}" "mobile" -site:gov -site:mil',
-            f'"{query}" "fax" -site:gov -site:mil',
-            f'intitle:"{query}" "contact"',
-            f'inurl:"{query}" "phone" filetype:pdf',
-            f'inurl:"{query}" "email" filetype:pdf',
-        ]
-        all_mentions = []
-        for dork in dorks[:6]:  # Batasi agar tidak terlalu agresif
-            encoded = urllib.parse.quote(dork)
-            url = f"https://www.google.com/search?q={encoded}&num=30"
-            html = self._fetch(url)
-            if not html:
-                continue
-            # Ekstrak hasil dasar
-            pattern = r'<a href="\/url\?q=(https?://[^&"]+)&[^"]*"[^>]*>(.*?)</a>'
-            matches = re.findall(pattern, html, re.IGNORECASE)
-            for url_clean, title in matches[:20]:
-                title_clean = re.sub(r'<[^>]+>', '', title).strip()
-                if title_clean and url_clean:
-                    all_mentions.append({
-                        'source': 'Google Dork',
-                        'title': title_clean[:200],
-                        'url': url_clean,
-                        'snippet': '',
-                        'dork': dork
-                    })
-            time.sleep(1)
-            if len(all_mentions) > 50:
-                break
-        return all_mentions
-
-    def search_white_pages(self, name: str) -> Dict[str, Set[str]]:
-        """Mencoba mendapatkan data dari situs white pages dan direktori publik."""
-        # Beberapa sumber white pages yang umum (gratis)
-        sources = {
-            'whitepages': f'https://www.whitepages.com/name/{urllib.parse.quote(name)}',
-            'pipl': f'https://pipl.com/search/?q={urllib.parse.quote(name)}',
-            'thatsthem': f'https://thatsthem.com/name/{urllib.parse.quote(name)}',
-            'spokeo': f'https://www.spokeo.com/{urllib.parse.quote(name)}',
-            'zabasearch': f'https://www.zabasearch.com/people/{urllib.parse.quote(name)}/'
-        }
-        results = {'phones': set(), 'emails': set(), 'addresses': set()}
-        
-        for site, url in sources.items():
-            html = self._fetch(url)
-            if not html:
-                continue
-            # Ekstraksi sederhana dengan regex untuk nomor telepon (format internasional dan lokal)
-            phone_pattern = r'(\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{1,4}[\s\-]?\d{1,4})|(\b0\d{2,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}\b)'
-            phones = re.findall(phone_pattern, html)
-            for phone_tuple in phones:
-                for p in phone_tuple:
-                    if p:
-                        results['phones'].add(p.strip())
-            
-            # Ekstraksi email
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            emails = re.findall(email_pattern, html)
-            results['emails'].update(emails)
-            
-            # Ekstraksi alamat (sederhana: mencari kata "street", "avenue", "road", "city", "zip")
-            address_pattern = r'\b\d{1,5}\s+[A-Za-z]+\s+(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|way)\b.*?(?:[A-Z]{2}\s?\d{5}(?:-\d{4})?)?'
-            addresses = re.findall(address_pattern, html, re.IGNORECASE)
-            results['addresses'].update([a.strip() for a in addresses if len(a) > 10])
-            
-            time.sleep(1.5)
-            logger.info(f"Hasil dari {site}: {len(results['phones'])} telepon, {len(results['emails'])} email, {len(results['addresses'])} alamat")
-        
-        return results
-
-    def search_haveibeenpwned(self, email: str) -> List[str]:
-        """Memeriksa apakah email pernah muncul di breach (API publik)."""
-        try:
-            url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{urllib.parse.quote(email)}"
-            resp = self.session.get(url, headers={'hibp-api-key': ''}, timeout=TIMEOUT)
-            if resp.status_code == 200:
-                data = resp.json()
-                return [b['Name'] for b in data]
-            elif resp.status_code == 404:
-                return []
-            else:
-                return []
-        except:
-            return []
-
-    def extract_contacts_from_text(self, text: str) -> Tuple[Set[str], Set[str], Set[str]]:
-        """Ekstrak semua kemungkinan kontak dari teks."""
+    # ---------- EKSTRAKSI KONTAK DARI TEKS ----------
+    def _extract_contacts_from_text(self, text: str) -> Tuple[Set[str], Set[str], Set[str]]:
         phones = set()
         emails = set()
         addresses = set()
@@ -224,7 +129,7 @@ class DeepDorkEngine:
         email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
         emails.update(re.findall(email_pattern, text))
         
-        # Alamat (heuristic)
+        # Alamat
         address_patterns = [
             r'\b\d{1,5}\s+[A-Za-z]+\s+(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|way|place|pl|court|ct)\b.*?(?:[A-Z]{2}\s?\d{5}(?:-\d{4})?)?',
             r'\b\d{5}(?:-\d{4})?\b',
@@ -235,7 +140,133 @@ class DeepDorkEngine:
         
         return phones, emails, addresses
 
-    # ---------- ORKESTRASI UTAMA ----------
+    # ---------- MODUL DORKING UTAMA ----------
+    def google_dork_phone_email_address(self, query: str) -> List[Dict]:
+        """
+        Dorking Google untuk mencari kontak. Kali ini kita ekstrak langsung dari snippet.
+        """
+        dorks = [
+            f'"{query}" "phone" -site:gov -site:mil',
+            f'"{query}" "email" -site:gov -site:mil',
+            f'"{query}" "address" -site:gov -site:mil',
+            f'"{query}" "tel:" -site:gov -site:mil',
+            f'"{query}" "mobile" -site:gov -site:mil',
+            f'"{query}" "contact" -site:gov -site:mil',
+            f'"{query}" "whatsapp" -site:gov -site:mil',
+            f'intitle:"{query}" "contact"',
+            f'inurl:"{query}" "phone" filetype:pdf',
+            f'inurl:"{query}" "email" filetype:pdf',
+        ]
+        all_mentions = []
+        for dork in dorks:
+            encoded = urllib.parse.quote(dork)
+            url = f"https://www.google.com/search?q={encoded}&num=30"
+            html = self._fetch(url)
+            if not html:
+                continue
+            
+            # Ekstrak hasil dengan BeautifulSoup jika tersedia
+            if HAS_SOUP:
+                soup = BeautifulSoup(html, 'html.parser')
+                # Cari elemen hasil (biasanya div dengan class tertentu)
+                result_blocks = soup.find_all('div', class_='g')
+                for block in result_blocks[:20]:
+                    title_tag = block.find('h3')
+                    title = title_tag.get_text(strip=True) if title_tag else ''
+                    link_tag = block.find('a')
+                    url_clean = link_tag.get('href') if link_tag else ''
+                    snippet_tag = block.find('div', class_='VwiC3b')
+                    snippet = snippet_tag.get_text(strip=True) if snippet_tag else ''
+                    
+                    # Gabungkan semua teks untuk ekstraksi
+                    full_text = f"{title} {snippet} {url_clean}"
+                    phones, emails, addresses = self._extract_contacts_from_text(full_text)
+                    
+                    # Simpan jika ada kontak
+                    if phones or emails or addresses:
+                        all_mentions.append({
+                            'source': 'Google Dork',
+                            'title': title[:200],
+                            'url': url_clean,
+                            'snippet': snippet[:500],
+                            'phones': list(phones),
+                            'emails': list(emails),
+                            'addresses': list(addresses),
+                            'dork': dork
+                        })
+            else:
+                # Fallback regex sederhana
+                pattern = r'<a href="\/url\?q=(https?://[^&"]+)&[^"]*"[^>]*>(.*?)</a>'
+                matches = re.findall(pattern, html, re.IGNORECASE)
+                for url_clean, title in matches[:20]:
+                    title_clean = re.sub(r'<[^>]+>', '', title).strip()
+                    # Ekstrak kontak dari judul dan URL
+                    full_text = f"{title_clean} {url_clean}"
+                    phones, emails, addresses = self._extract_contacts_from_text(full_text)
+                    if phones or emails or addresses:
+                        all_mentions.append({
+                            'source': 'Google Dork (regex)',
+                            'title': title_clean[:200],
+                            'url': url_clean,
+                            'snippet': '',
+                            'phones': list(phones),
+                            'emails': list(emails),
+                            'addresses': list(addresses),
+                            'dork': dork
+                        })
+            time.sleep(1)
+            if len(all_mentions) > 100:
+                break
+        return all_mentions
+
+    # ---------- WHITE PAGES ----------
+    def search_white_pages(self, name: str) -> Dict[str, Set[str]]:
+        sources = {
+            'whitepages': f'https://www.whitepages.com/name/{urllib.parse.quote(name)}',
+            'pipl': f'https://pipl.com/search/?q={urllib.parse.quote(name)}',
+            'thatsthem': f'https://thatsthem.com/name/{urllib.parse.quote(name)}',
+            'spokeo': f'https://www.spokeo.com/{urllib.parse.quote(name)}',
+            'zabasearch': f'https://www.zabasearch.com/people/{urllib.parse.quote(name)}/'
+        }
+        results = {'phones': set(), 'emails': set(), 'addresses': set()}
+        
+        for site, url in sources.items():
+            html = self._fetch(url)
+            if not html:
+                continue
+            # Ekstrak dengan BeautifulSoup jika tersedia
+            if HAS_SOUP:
+                soup = BeautifulSoup(html, 'html.parser')
+                text = soup.get_text()
+                phones, emails, addresses = self._extract_contacts_from_text(text)
+            else:
+                phones, emails, addresses = self._extract_contacts_from_text(html)
+            
+            results['phones'].update(phones)
+            results['emails'].update(emails)
+            results['addresses'].update(addresses)
+            
+            time.sleep(1.5)
+            logger.info(f"Hasil dari {site}: {len(phones)} telepon, {len(emails)} email, {len(addresses)} alamat")
+        
+        return results
+
+    # ---------- HAVE I BEEN PWNED ----------
+    def search_haveibeenpwned(self, email: str) -> List[str]:
+        try:
+            url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{urllib.parse.quote(email)}"
+            resp = self.session.get(url, headers={'hibp-api-key': ''}, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                return [b['Name'] for b in data]
+            elif resp.status_code == 404:
+                return []
+            else:
+                return []
+        except:
+            return []
+
+    # ---------- ORKESTRASI ----------
     def run(self) -> ContactInfo:
         logger.info(f"Memulai deep OSINT untuk: {self.full_name}")
         
@@ -244,7 +275,7 @@ class DeepDorkEngine:
         for variant in self._variants[:4]:
             mentions = self.google_dork_phone_email_address(variant)
             all_mentions.extend(mentions)
-            logger.info(f"Dork '{variant}' menghasilkan {len(mentions)} hasil")
+            logger.info(f"Dork '{variant}' menghasilkan {len(mentions)} hasil dengan kontak")
         
         # 2. White Pages & direktori publik
         wp_results = self.search_white_pages(self.full_name)
@@ -252,15 +283,14 @@ class DeepDorkEngine:
         self.info.emails.update(wp_results['emails'])
         self.info.addresses.update(wp_results['addresses'])
         
-        # 3. Ekstraksi kontak dari semua hasil Google
-        combined_text = " ".join([m.get('title','') + " " + m.get('url','') for m in all_mentions])
-        phones, emails, addresses = self.extract_contacts_from_text(combined_text)
-        self.info.phones.update(phones)
-        self.info.emails.update(emails)
-        self.info.addresses.update(addresses)
+        # 3. Ekstrak dari semua hasil Google (menggunakan hasil yang sudah diekstrak)
+        for mention in all_mentions:
+            self.info.phones.update(mention.get('phones', []))
+            self.info.emails.update(mention.get('emails', []))
+            self.info.addresses.update(mention.get('addresses', []))
         
-        # 4. Periksa breach untuk setiap email yang ditemukan
-        for email in list(self.info.emails)[:5]:  # Batasi untuk performa
+        # 4. Periksa breach untuk setiap email
+        for email in list(self.info.emails)[:5]:
             breaches = self.search_haveibeenpwned(email)
             if breaches:
                 self.info.raw_mentions.append({
@@ -270,13 +300,12 @@ class DeepDorkEngine:
                 })
                 logger.info(f"Email {email} muncul di breach: {', '.join(breaches)}")
         
-        # 5. Simpan hasil mentah
+        # 5. Simpan mentah
         self.info.raw_mentions.extend(all_mentions[:100])
         logger.info(f"Deep OSINT selesai. Ditemukan: {len(self.info.phones)} telepon, {len(self.info.emails)} email, {len(self.info.addresses)} alamat")
         return self.info
 
     def save_txt(self, info: ContactInfo) -> Path:
-        """Simpan hasil dalam file teks dengan format yang diminta."""
         filename = OUTPUT_DIR / f"{info.name.replace(' ', '_')}_osint_report.txt"
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("="*60 + "\n")
@@ -334,7 +363,7 @@ class DeepDorkEngine:
             f.write("MENTIONS DARI GOOGLE (sampel):\n")
             count = 0
             for item in info.raw_mentions:
-                if isinstance(item, dict) and item.get('source') == 'Google Dork':
+                if isinstance(item, dict) and item.get('source', '').startswith('Google'):
                     f.write(f"  - {item.get('title', '')[:80]}... -> {item.get('url', '')}\n")
                     count += 1
                     if count >= 20:
