@@ -2,16 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Deep Dork Advanced v3.0
+Deep Dork Advanced v3.1 (Tanpa pandas)
 Penulis: Lyra untuk Kael
-Deskripsi: OSINT multi-mesin pencari + ekstraktor kontak (telepon, email, alamat)
-Fitur:
-- Google, Bing, DuckDuckGo
-- Proxy & User-Agent rotasi
-- Ekstraksi otomatis dari halaman hasil
-- Validasi data kontak
-- Ekspor JSON, CSV, TXT
-- Deteksi CAPTCHA
 """
 
 import argparse
@@ -23,33 +15,31 @@ import random
 import re
 import sys
 import time
+import csv
 import concurrent.futures
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import quote_plus
 from typing import List, Dict, Set, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
-import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Optional: jika tidak tersedia, kita fallback ke requests saja
 try:
     import yagooglesearch
 except ImportError:
     yagooglesearch = None
 
 # ---------- Konfigurasi ----------
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 DEFAULT_DELAY_MIN = 37
 DEFAULT_DELAY_MAX = 60
 DEFAULT_MAX_RESULTS = 100
 USER_AGENT = UserAgent()
-SESSION = None  # akan diinisialisasi nanti
 
-# Daftar dork bawaan untuk kontak (bisa ditambah)
+# Daftar dork bawaan untuk kontak
 DEFAULT_DORKS = [
     '"phone" "email"',
     '"contact" "phone"',
@@ -85,10 +75,6 @@ def random_delay(min_sec: int, max_sec: int):
     return delay
 
 def extract_contacts(html: str) -> Tuple[Set[str], Set[str], Set[str]]:
-    """
-    Ekstrak nomor telepon, email, dan alamat dari teks HTML.
-    """
-    # Hapus tag untuk teks bersih
     soup = BeautifulSoup(html, 'html.parser')
     for script in soup(["script", "style"]):
         script.decompose()
@@ -98,7 +84,6 @@ def extract_contacts(html: str) -> Tuple[Set[str], Set[str], Set[str]]:
     emails = set()
     addresses = set()
     
-    # Pola telepon (internasional, lokal, dengan pemisah)
     phone_patterns = [
         r'\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{1,4}[\s\-]?\d{1,4}',
         r'\b0\d{2,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}\b',
@@ -107,32 +92,26 @@ def extract_contacts(html: str) -> Tuple[Set[str], Set[str], Set[str]]:
         r'\b\d{3}\.\d{3}\.\d{4}\b',
     ]
     for pat in phone_patterns:
-        matches = re.findall(pat, text)
-        for m in matches:
-            # Filter panjang minimal
+        for m in re.findall(pat, text):
             if len(m) >= 7:
                 phones.add(m.strip())
     
-    # Email
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
     emails.update(re.findall(email_pattern, text))
     
-    # Alamat (heuristic)
     address_patterns = [
         r'\b\d{1,5}\s+[A-Za-z]+\s+(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|way|place|pl|court|ct)\b.*?(?:[A-Z]{2}\s?\d{5}(?:-\d{4})?)?',
         r'\b\d{5}(?:-\d{4})?\b',
         r'\b[A-Z][a-z]+,\s*[A-Z]{2}\s*\d{5}\b',
     ]
     for pat in address_patterns:
-        matches = re.findall(pat, text, re.IGNORECASE)
-        for m in matches:
+        for m in re.findall(pat, text, re.IGNORECASE):
             if len(m) > 10:
                 addresses.add(m.strip())
     
     return phones, emails, addresses
 
 def search_google(query: str, max_results: int = 100, proxy: str = None, verify_ssl: bool = True) -> List[str]:
-    """Menggunakan yagooglesearch jika tersedia, fallback ke requests."""
     if yagooglesearch:
         try:
             client = yagooglesearch.SearchClient(
@@ -147,48 +126,27 @@ def search_google(query: str, max_results: int = 100, proxy: str = None, verify_
             client.assign_random_user_agent()
             return client.search()
         except Exception as e:
-            logging.warning(f"yagooglesearch gagal: {e}, fallback ke requests")
-    
-    # Fallback: requests + BeautifulSoup (simplifikasi)
-    # Sebenarnya kita bisa scraping hasil Google, tapi ini rentan blokir.
-    # Kita akan gunakan pendekatan sederhana: tidak diimplementasikan di sini.
-    # Untuk fallback, kita kembalikan list kosong.
-    logging.warning("Google search fallback tidak diimplementasikan; menggunakan hasil kosong.")
+            logging.warning(f"yagooglesearch gagal: {e}, fallback ke kosong")
     return []
 
 def search_bing(query: str, max_results: int = 100, proxy: str = None, verify_ssl: bool = True) -> List[str]:
-    """Scrape hasil pencarian Bing."""
     urls = []
     session = setup_session(proxy, verify_ssl)
-    headers = {
-        'User-Agent': USER_AGENT.random,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    # Bing menggunakan parameter count untuk jumlah hasil per halaman
-    # Kita akan loop beberapa halaman
+    headers = {'User-Agent': USER_AGENT.random}
     for page in range(0, min(max_results, 1000), 10):
-        params = {
-            'q': query,
-            'count': 10,
-            'first': page + 1,
-        }
-        url = 'https://www.bing.com/search'
+        params = {'q': query, 'count': 10, 'first': page + 1}
         try:
-            resp = session.get(url, params=params, headers=headers, timeout=20)
+            resp = session.get('https://www.bing.com/search', params=params, headers=headers, timeout=20)
             if resp.status_code != 200:
                 break
             soup = BeautifulSoup(resp.text, 'html.parser')
-            # Cari semua link hasil
             for a in soup.select('li.b_algo h2 a'):
                 href = a.get('href')
                 if href and href.startswith('http'):
                     urls.append(href)
-            # Deteksi CAPTCHA
             if 'captcha' in resp.text.lower():
-                logging.warning("Bing meminta CAPTCHA, hentikan.")
+                logging.warning("Bing CAPTCHA detected")
                 break
-            # Jeda antar halaman
             time.sleep(random.uniform(1, 3))
         except Exception as e:
             logging.error(f"Bing error: {e}")
@@ -198,33 +156,22 @@ def search_bing(query: str, max_results: int = 100, proxy: str = None, verify_ss
     return urls[:max_results]
 
 def search_duckduckgo(query: str, max_results: int = 100, proxy: str = None, verify_ssl: bool = True) -> List[str]:
-    """Scrape hasil pencarian DuckDuckGo (menggunakan lite version)."""
     urls = []
     session = setup_session(proxy, verify_ssl)
-    # Gunakan versi lite untuk parsing mudah
-    url = 'https://lite.duckduckgo.com/lite/'
-    params = {
-        'q': query,
-        's': 0,
-    }
-    headers = {'User-Agent': USER_AGENT.random}
+    params = {'q': query, 's': 0}
     try:
-        resp = session.get(url, params=params, headers=headers, timeout=20)
+        resp = session.get('https://lite.duckduckgo.com/lite/', params=params, timeout=20)
         if resp.status_code != 200:
             return []
         soup = BeautifulSoup(resp.text, 'html.parser')
-        # Di lite, hasil ada di tabel dengan class 'result'
         for tr in soup.find_all('tr', class_='result'):
             td = tr.find('td')
             if td:
                 a = td.find('a')
-                if a and a.get('href'):
-                    href = a['href']
-                    if href.startswith('http'):
-                        urls.append(href)
-        # Deteksi CAPTCHA
+                if a and a.get('href') and a['href'].startswith('http'):
+                    urls.append(a['href'])
         if 'captcha' in resp.text.lower():
-            logging.warning("DuckDuckGo meminta CAPTCHA.")
+            logging.warning("DuckDuckGo CAPTCHA detected")
     except Exception as e:
         logging.error(f"DuckDuckGo error: {e}")
     return urls[:max_results]
@@ -259,53 +206,39 @@ class DeepDorkEngine:
         
         self.log = logging.getLogger('DeepDork')
         self.total_urls = 0
-        self.all_contacts = {
-            'phones': set(),
-            'emails': set(),
-            'addresses': set(),
-        }
-        self.results = []  # List of dict per dork
-        
-        # Siapkan sesi untuk scraping halaman
+        self.all_contacts = {'phones': set(), 'emails': set(), 'addresses': set()}
+        self.results = []
         self.session = setup_session(verify_ssl=verify_ssl)
     
     def _get_proxy(self):
-        if self.proxies:
-            return random.choice(self.proxies)
-        return None
+        return random.choice(self.proxies) if self.proxies else None
     
     def _search_engine(self, engine: str, query: str) -> List[str]:
-        if engine.lower() == 'google':
-            return search_google(query, self.max_results, self._get_proxy(), self.verify_ssl)
-        elif engine.lower() == 'bing':
-            return search_bing(query, self.max_results, self._get_proxy(), self.verify_ssl)
-        elif engine.lower() == 'duckduckgo':
-            return search_duckduckgo(query, self.max_results, self._get_proxy(), self.verify_ssl)
-        else:
-            self.log.warning(f"Engine {engine} tidak dikenal.")
-            return []
+        engine_map = {
+            'google': search_google,
+            'bing': search_bing,
+            'duckduckgo': search_duckduckgo,
+        }
+        func = engine_map.get(engine.lower())
+        if func:
+            return func(query, self.max_results, self._get_proxy(), self.verify_ssl)
+        self.log.warning(f"Engine {engine} tidak dikenal")
+        return []
     
     def _visit_url_and_extract(self, url: str) -> Dict:
-        """Kunjungi URL, ambil konten, ekstrak kontak."""
         if not self.extract_contacts:
             return {}
         try:
             resp = self.session.get(url, timeout=15)
             if resp.status_code == 200:
                 phones, emails, addresses = extract_contacts(resp.text)
-                return {
-                    'url': url,
-                    'phones': list(phones),
-                    'emails': list(emails),
-                    'addresses': list(addresses),
-                }
-        except Exception as e:
-            self.log.debug(f"Gagal mengunjungi {url}: {e}")
+                return {'url': url, 'phones': list(phones), 'emails': list(emails), 'addresses': list(addresses)}
+        except Exception:
+            pass
         return {}
     
     def _check_breach(self, emails: Set[str]) -> Dict:
-        """Periksa email di Have I Been Pwned."""
-        if not self.check_breach:
+        if not self.check_breach or not emails:
             return {}
         breached = {}
         for email in emails:
@@ -325,17 +258,13 @@ class DeepDorkEngine:
         return breached
     
     def run(self):
-        self.log.info(f"Memulai Deep Dork Advanced v{VERSION}")
+        self.log.info(f"Deep Dork Advanced v{VERSION} dimulai")
         self.log.info(f"Dorks: {len(self.dorks)}, Domain: {self.domain or '(none)'}")
         self.log.info(f"Mesin: {', '.join(self.engines)}")
         
-        timestamp_start = datetime.datetime.now().isoformat()
-        
-        dork_count = 0
-        for dork in self.dorks:
-            dork_count += 1
+        for idx, dork in enumerate(self.dorks, 1):
             query = f"site:{self.domain} {dork}" if self.domain else dork
-            self.log.info(f"({dork_count}/{len(self.dorks)}) Mengeksekusi: {query}")
+            self.log.info(f"({idx}/{len(self.dorks)}) Eksekusi: {query}")
             
             dork_result = {
                 'dork': dork,
@@ -346,48 +275,37 @@ class DeepDorkEngine:
                 'contacts': {'phones': [], 'emails': [], 'addresses': []},
             }
             
-            # Cari di setiap mesin
             for engine in self.engines:
                 try:
                     urls = self._search_engine(engine, query)
-                    self.log.info(f"  {engine}: {len(urls)} URL ditemukan")
+                    self.log.info(f"  {engine}: {len(urls)} URL")
                     dork_result['engine_results'][engine] = urls
                     dork_result['urls'].extend(urls)
                 except Exception as e:
                     self.log.error(f"  {engine} error: {e}")
                     dork_result['engine_results'][engine] = []
             
-            # Unique URLs
             unique_urls = list(set(dork_result['urls']))
             dork_result['urls'] = unique_urls
             dork_result['total_urls'] = len(unique_urls)
             self.total_urls += len(unique_urls)
             
-            # Ekstrak kontak dari setiap URL (parallel)
             if self.extract_contacts and unique_urls:
                 self.log.info(f"  Mengunjungi {len(unique_urls)} URL untuk ekstraksi kontak...")
-                all_phones = set()
-                all_emails = set()
-                all_addresses = set()
-                # Gunakan thread pool untuk kecepatan
+                all_phones, all_emails, all_addresses = set(), set(), set()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    future_to_url = {executor.submit(self._visit_url_and_extract, url): url for url in unique_urls}
-                    for future in concurrent.futures.as_completed(future_to_url):
-                        url = future_to_url[future]
-                        try:
-                            data = future.result()
-                            if data:
-                                all_phones.update(data.get('phones', []))
-                                all_emails.update(data.get('emails', []))
-                                all_addresses.update(data.get('addresses', []))
-                        except Exception as e:
-                            self.log.debug(f"Thread error untuk {url}: {e}")
+                    futures = [executor.submit(self._visit_url_and_extract, url) for url in unique_urls]
+                    for future in concurrent.futures.as_completed(futures):
+                        data = future.result()
+                        if data:
+                            all_phones.update(data.get('phones', []))
+                            all_emails.update(data.get('emails', []))
+                            all_addresses.update(data.get('addresses', []))
                 
                 dork_result['contacts']['phones'] = list(all_phones)
                 dork_result['contacts']['emails'] = list(all_emails)
                 dork_result['contacts']['addresses'] = list(all_addresses)
                 
-                # Update master contacts
                 self.all_contacts['phones'].update(all_phones)
                 self.all_contacts['emails'].update(all_emails)
                 self.all_contacts['addresses'].update(all_addresses)
@@ -396,28 +314,23 @@ class DeepDorkEngine:
             
             self.results.append(dork_result)
             
-            # Jeda antar dork
-            if dork_count < len(self.dorks):
+            if idx < len(self.dorks):
                 delay = random.uniform(self.min_delay, self.max_delay)
                 self.log.info(f"  Jeda {delay:.1f} detik...")
                 time.sleep(delay)
         
-        # Periksa breach untuk email yang ditemukan
+        # Cek breach
         breached = {}
         if self.check_breach and self.all_contacts['emails']:
-            self.log.info(f"Memeriksa {len(self.all_contacts['emails'])} email di Have I Been Pwned...")
+            self.log.info(f"Memeriksa {len(self.all_contacts['emails'])} email di HIBP...")
             breached = self._check_breach(self.all_contacts['emails'])
         
-        # Simpan hasil
         self._save_results(breached)
-        
-        timestamp_end = datetime.datetime.now().isoformat()
         self.log.info(f"Selesai. Total URL unik: {self.total_urls}")
         self.log.info(f"Kontak: {len(self.all_contacts['phones'])} telepon, {len(self.all_contacts['emails'])} email, {len(self.all_contacts['addresses'])} alamat")
-        self.log.info(f"Hasil disimpan dengan prefix: {self.output_prefix}")
     
     def _save_results(self, breached: Dict):
-        # Simpan JSON
+        # JSON
         json_file = f"{self.output_prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump({
@@ -428,26 +341,25 @@ class DeepDorkEngine:
                 'breached_emails': breached,
                 'results': self.results,
             }, f, indent=2)
-        self.log.info(f"JSON saved: {json_file}")
+        self.log.info(f"JSON: {json_file}")
         
-        # Simpan CSV
+        # CSV (tanpa pandas)
         csv_file = f"{self.output_prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        rows = []
-        for res in self.results:
-            for url in res['urls']:
-                rows.append({
-                    'dork': res['dork'],
-                    'url': url,
-                    'phones': ', '.join(res['contacts']['phones']),
-                    'emails': ', '.join(res['contacts']['emails']),
-                    'addresses': ', '.join(res['contacts']['addresses']),
-                })
-        if rows:
-            df = pd.DataFrame(rows)
-            df.to_csv(csv_file, index=False, encoding='utf-8')
-            self.log.info(f"CSV saved: {csv_file}")
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['dork', 'url', 'phones', 'emails', 'addresses'])
+            for res in self.results:
+                for url in res['urls']:
+                    writer.writerow([
+                        res['dork'],
+                        url,
+                        '; '.join(res['contacts']['phones']),
+                        '; '.join(res['contacts']['emails']),
+                        '; '.join(res['contacts']['addresses']),
+                    ])
+        self.log.info(f"CSV: {csv_file}")
         
-        # Simpan TXT (format sederhana)
+        # TXT
         txt_file = f"{self.output_prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(txt_file, 'w', encoding='utf-8') as f:
             f.write(f"DEEP DORK ADVANCED v{VERSION}\n")
@@ -455,8 +367,8 @@ class DeepDorkEngine:
             f.write(f"Total URL unik: {self.total_urls}\n")
             f.write(f"Telepon: {len(self.all_contacts['phones'])}\n")
             f.write(f"Email: {len(self.all_contacts['emails'])}\n")
-            f.write(f"Alamat: {len(self.all_contacts['addresses'])}\n")
-            f.write("\n--- KONTAK ---\n")
+            f.write(f"Alamat: {len(self.all_contacts['addresses'])}\n\n")
+            f.write("--- KONTAK ---\n")
             f.write("Telepon:\n")
             for p in sorted(self.all_contacts['phones']):
                 f.write(f"  {p}\n")
@@ -478,45 +390,38 @@ class DeepDorkEngine:
                 f.write("URL:\n")
                 for url in res['urls']:
                     f.write(f"  {url}\n")
-        self.log.info(f"TXT saved: {txt_file}")
+        self.log.info(f"TXT: {txt_file}")
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description=f"Deep Dork Advanced v{VERSION} - OSINT multi-mesin + ekstraktor kontak")
-    parser.add_argument('-g', '--google-dorks', type=str, help='File berisi daftar dork (satu per baris)')
-    parser.add_argument('-d', '--domain', type=str, help='Domain untuk dibatasi (opsional)')
-    parser.add_argument('-m', '--max-results', type=int, default=DEFAULT_MAX_RESULTS, help=f'Maks URL per dork per mesin (default {DEFAULT_MAX_RESULTS})')
-    parser.add_argument('-i', '--min-delay', type=int, default=DEFAULT_DELAY_MIN, help=f'Jeda minimum antar dork (detik, default {DEFAULT_DELAY_MIN})')
-    parser.add_argument('-x', '--max-delay', type=int, default=DEFAULT_DELAY_MAX, help=f'Jeda maksimum (detik, default {DEFAULT_DELAY_MAX})')
-    parser.add_argument('-p', '--proxies', type=str, help='Proxy terpisah koma (contoh: socks5://127.0.0.1:9050,http://proxy:8080)')
-    parser.add_argument('--no-verify-ssl', action='store_true', help='Nonaktifkan verifikasi SSL')
-    parser.add_argument('--engines', type=str, default='google,bing,duckduckgo', help='Mesin pencari, pisah koma (default: google,bing,duckduckgo)')
-    parser.add_argument('--no-extract', action='store_true', help='Nonaktifkan ekstraksi kontak (hanya kumpulkan URL)')
-    parser.add_argument('--no-breach', action='store_true', help='Nonaktifkan pengecekan breach email')
-    parser.add_argument('-o', '--output-prefix', type=str, default='deep_dork', help='Prefiks file output (default: deep_dork)')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Mode verbose')
+    parser = argparse.ArgumentParser(description=f"Deep Dork Advanced v{VERSION}")
+    parser.add_argument('-g', '--google-dorks', type=str, help='File dork (satu per baris)')
+    parser.add_argument('-d', '--domain', type=str, help='Domain batasan')
+    parser.add_argument('-m', '--max-results', type=int, default=DEFAULT_MAX_RESULTS)
+    parser.add_argument('-i', '--min-delay', type=int, default=DEFAULT_DELAY_MIN)
+    parser.add_argument('-x', '--max-delay', type=int, default=DEFAULT_DELAY_MAX)
+    parser.add_argument('-p', '--proxies', type=str, help='Proxy comma separated')
+    parser.add_argument('--no-verify-ssl', action='store_true')
+    parser.add_argument('--engines', type=str, default='google,bing,duckduckgo')
+    parser.add_argument('--no-extract', action='store_true')
+    parser.add_argument('--no-breach', action='store_true')
+    parser.add_argument('-o', '--output-prefix', type=str, default='deep_dork')
+    parser.add_argument('-v', '--verbose', action='store_true')
     
     args = parser.parse_args()
     
-    # Logging
     logging.basicConfig(level=logging.INFO if not args.verbose else logging.DEBUG, format=LOG_FORMAT)
     
-    # Dorks
     if args.google_dorks and os.path.exists(args.google_dorks):
         with open(args.google_dorks, 'r', encoding='utf-8') as f:
             dorks = [line.strip() for line in f if line.strip()]
     else:
-        # Gunakan dork bawaan
         dorks = DEFAULT_DORKS
-        logging.warning("Tidak ada file dork, menggunakan dork bawaan.")
+        logging.warning("Tidak ada file dork, menggunakan bawaan.")
     
-    # Proxies
     proxies = args.proxies.split(',') if args.proxies else []
-    
-    # Engines
     engines = [e.strip() for e in args.engines.split(',') if e.strip()]
     
-    # Jalankan
     engine = DeepDorkEngine(
         dorks=dorks,
         domain=args.domain,
